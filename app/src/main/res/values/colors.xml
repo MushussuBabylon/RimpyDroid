@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- White: the first thing on screen is the white theme. The app repaints the window itself when the
+         black setting is chosen. -->
+    <color name="window_bg">#FFFFFF</color>
+</resources>
