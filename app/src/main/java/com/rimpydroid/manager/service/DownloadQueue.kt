@@ -2,10 +2,14 @@ package com.rimpydroid.manager.service
 
 import android.content.Context
 import com.rimpydroid.manager.AppLog
+import com.rimpydroid.manager.core.AppConfig
 import com.rimpydroid.manager.core.FileUtil
 import com.rimpydroid.manager.core.InstallInfo
+import com.rimpydroid.manager.steam.ChunkGate
 import com.rimpydroid.manager.steam.DownloadOutcome
 import com.rimpydroid.manager.steam.DownloadRequest
+import com.rimpydroid.manager.steam.GatedBackend
+import com.rimpydroid.manager.steam.JavaSteamBackend
 import com.rimpydroid.manager.steam.SteamDownloader
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -46,10 +50,27 @@ data class QueueRequest(
 )
 
 /**
- * The list of downloads of the whole app. A single worker thread processes it in order over one
- * Steam connection; [DownloadService] keeps the process alive and shows the notification.
+ * The list of downloads of the whole app. Up to [maxParallelMods] worker threads take the waiting mods in order,
+ * so several mods download at the same time. Every worker has its own Steam connection (a downloader is not
+ * thread-safe). A gate holds all workers together to [totalConnections] chunks in flight, because every chunk
+ * costs memory, so a high number of mods at once cannot use up the heap of the phone. [DownloadService] keeps the
+ * process alive and shows the notification.
  */
 object DownloadQueue {
+
+    /** Heap that is reckoned for one chunk in flight (it needs several MB while it is downloaded and unpacked). */
+    private const val HEAP_PER_CONNECTION = 32L * 1024 * 1024
+    private const val MIN_CONNECTIONS = 4
+    private const val MAX_CONNECTIONS = 16
+
+    /** Tries per item for failures that may pass (a bad download server, a dropped connection). */
+    private const val MAX_ATTEMPTS = 3
+
+    /** Workers that start together log in to Steam one after the other, not all in the same moment. */
+    private const val WORKER_STAGGER_MS = 400L
+
+    /** The list on screen is not redrawn for every single progress report of every mod. */
+    private const val PROGRESS_PUSH_MS = 500L
 
     private val lock = Any()
     private val _tasks = MutableStateFlow<List<DownloadTask>>(emptyList())
@@ -60,23 +81,55 @@ object DownloadQueue {
     /** Emits the Workshop id of every mod that was installed or updated successfully. */
     val installed: SharedFlow<Long> = _installed.asSharedFlow()
 
+    /** Connections (chunks in flight) for all mods together, as chosen in the settings. See [totalConnections]. */
     @Volatile
     var maxDownloads: Int = 8
+        set(value) {
+            field = value
+            chunkGate.setLimit(totalConnections())
+        }
+
+    /** Every chunk in flight, of whichever mod, passes this gate. */
+    private val chunkGate = ChunkGate(totalConnections())
+
+    /**
+     * How many mods download at the same time, [AppConfig.MIN_PARALLEL_MODS] to [AppConfig.MAX_PARALLEL_MODS].
+     * A change counts at once: more workers start when mods are waiting; when the number is lowered, the surplus
+     * workers stop after the mod they are busy with.
+     */
+    @Volatile
+    var maxParallelMods: Int = AppConfig.DEFAULT_PARALLEL_MODS
+        set(value) {
+            field = value.coerceIn(AppConfig.MIN_PARALLEL_MODS, AppConfig.MAX_PARALLEL_MODS)
+            synchronized(lock) { startWorkersLocked() }
+        }
 
     /** Test hook: how long a transfer may deliver nothing before it counts as stuck. */
     @Volatile
     var stallMs: Long = 120_000L
 
-    /** Test hook: how the worker gets its downloader. */
+    /** Test hook: how a worker gets its downloader. Every worker asks for its own. */
     @Volatile
-    var downloaderFactory: () -> SteamDownloader = { SteamDownloader(maxDownloads, stallMs) }
+    var downloaderFactory: () -> SteamDownloader = {
+        SteamDownloader(connectionsPerMod(), stallMs, backend = GatedBackend(JavaSteamBackend(), chunkGate))
+    }
+
+    /** The most chunks that fit into the memory of this phone at once. */
+    fun memoryCap(): Int =
+        (Runtime.getRuntime().maxMemory() / HEAP_PER_CONNECTION).toInt().coerceIn(MIN_CONNECTIONS, MAX_CONNECTIONS)
+
+    /** Chunks in flight over all mods: the choice in the settings, but never more than [memoryCap]. */
+    fun totalConnections(): Int = maxDownloads.coerceIn(2, memoryCap())
+
+    /**
+     * Threads (connections) one mod uses. The gate holds all mods together to [totalConnections]; a mod may have up
+     * to twice its fair share of threads, so it can use what the others leave free. A downloader never uses fewer than 2.
+     */
+    fun connectionsPerMod(): Int = maxOf(2, minOf(totalConnections(), 2 * totalConnections() / maxParallelMods))
 
     /** Test hook: base pause before another attempt at an item that failed for a reason that may pass. */
     @Volatile
     var retryPauseMs: Long = 2_000L
-
-    /** Tries per item for failures that may pass (a bad download server, a dropped connection). */
-    private const val MAX_ATTEMPTS = 3
 
     @Volatile
     private var appContext: Context? = null
@@ -90,10 +143,10 @@ object DownloadQueue {
         appContext?.let { DownloadService.start(it) }
     }
 
-    private var workerAlive = false
+    /** Number of worker threads that are alive. Guarded by [lock]. */
+    private var workerCount = 0
+    private var nextWorkerId = 1
 
-    @Volatile
-    private var cancelAll = false
     private val cancelled = ConcurrentHashMap.newKeySet<Long>()
 
     val isBusy: Boolean
@@ -103,38 +156,35 @@ object DownloadQueue {
     fun enqueue(requests: List<QueueRequest>): Int {
         var added = 0
         synchronized(lock) {
-            val list = _tasks.value.toMutableList()
-            for (r in requests) {
-                val i = list.indexOfFirst { it.workshopId == r.workshopId }
-                if (i >= 0) {
-                    val old = list[i]
-                    if (old.status == TaskStatus.QUEUED || old.status == TaskStatus.RUNNING) continue
-                    list.removeAt(i)
+            // update() repeats the change when a worker changed a task meanwhile, so no progress or result gets lost
+            _tasks.update { current ->
+                val list = current.toMutableList()
+                var n = 0
+                for (r in requests) {
+                    val i = list.indexOfFirst { it.workshopId == r.workshopId }
+                    if (i >= 0) {
+                        val old = list[i]
+                        if (old.status == TaskStatus.QUEUED || old.status == TaskStatus.RUNNING) continue
+                        list.removeAt(i)
+                    }
+                    cancelled.remove(r.workshopId)
+                    list.add(
+                        DownloadTask(
+                            workshopId = r.workshopId,
+                            title = r.title.ifBlank { "Workshop item ${r.workshopId}" },
+                            installDir = r.installDir.absolutePath,
+                            isUpdate = r.isUpdate,
+                            expectedManifest = r.expectedManifest,
+                            timeUpdated = r.timeUpdated,
+                            sizeHint = r.sizeHint,
+                        ),
+                    )
+                    n++
                 }
-                cancelled.remove(r.workshopId)
-                list.add(
-                    DownloadTask(
-                        workshopId = r.workshopId,
-                        title = r.title.ifBlank { "Workshop item ${r.workshopId}" },
-                        installDir = r.installDir.absolutePath,
-                        isUpdate = r.isUpdate,
-                        expectedManifest = r.expectedManifest,
-                        timeUpdated = r.timeUpdated,
-                        sizeHint = r.sizeHint,
-                    ),
-                )
-                added++
+                added = n
+                list
             }
-            _tasks.value = list
-            if (added > 0) {
-                cancelAll = false
-                if (!workerAlive) {
-                    workerAlive = true
-                    val t = Thread({ runWorker() }, "download-worker")
-                    t.isDaemon = true
-                    t.start()
-                }
-            }
+            if (added > 0) startWorkersLocked()
         }
         if (added > 0) startService()
         return added
@@ -153,9 +203,12 @@ object DownloadQueue {
 
     fun cancelAll() {
         synchronized(lock) {
-            cancelAll = true
             _tasks.update { list ->
                 list.map { if (it.status == TaskStatus.QUEUED) it.copy(status = TaskStatus.CANCELLED, message = "Cancelled") else it }
+            }
+            // what is running stops as soon as its worker notices
+            for (t in _tasks.value) {
+                if (t.status == TaskStatus.RUNNING) cancelled.add(t.workshopId)
             }
         }
     }
@@ -164,25 +217,23 @@ object DownloadQueue {
     fun retryFailed(): Int {
         var n = 0
         synchronized(lock) {
-            _tasks.update { list ->
-                list.map {
-                    if (it.status == TaskStatus.FAILED || it.status == TaskStatus.CANCELLED) {
-                        n++
-                        cancelled.remove(it.workshopId)
-                        it.copy(status = TaskStatus.QUEUED, percent = 0f, bytes = 0L, message = "")
-                    } else {
-                        it
+            val ids = HashSet<Long>()
+            for (t in _tasks.value) {
+                if (t.status == TaskStatus.FAILED || t.status == TaskStatus.CANCELLED) ids.add(t.workshopId)
+            }
+            if (ids.isNotEmpty()) {
+                for (id in ids) cancelled.remove(id)
+                _tasks.update { list ->
+                    list.map {
+                        if (it.workshopId in ids && (it.status == TaskStatus.FAILED || it.status == TaskStatus.CANCELLED)) {
+                            it.copy(status = TaskStatus.QUEUED, percent = 0f, bytes = 0L, message = "")
+                        } else {
+                            it
+                        }
                     }
                 }
-            }
-            if (n > 0) {
-                cancelAll = false
-                if (!workerAlive) {
-                    workerAlive = true
-                    val t = Thread({ runWorker() }, "download-worker")
-                    t.isDaemon = true
-                    t.start()
-                }
+                n = ids.size
+                startWorkersLocked()
             }
         }
         if (n > 0) startService()
@@ -196,29 +247,90 @@ object DownloadQueue {
         }
     }
 
-    // ---- worker ------------------------------------------------------------------------------------
+    // ---- workers -----------------------------------------------------------------------------------
 
     private fun replace(id: Long, change: (DownloadTask) -> DownloadTask) {
         _tasks.update { list -> list.map { if (it.workshopId == id) change(it) else it } }
     }
 
-    private fun isCancelled(id: Long): Boolean = cancelAll || cancelled.contains(id)
+    private fun isCancelled(id: Long): Boolean = cancelled.contains(id)
 
-    private fun runWorker() {
-        val downloader = downloaderFactory()
+    /**
+     * Starts as many workers as are useful: never more than [maxParallelMods], and none for which no mod is waiting.
+     * Call with [lock] held.
+     */
+    private fun startWorkersLocked() {
+        val list = _tasks.value
+        val running = list.count { it.status == TaskStatus.RUNNING }
+        val queued = list.count { it.status == TaskStatus.QUEUED }
+        val idle = (workerCount - running).coerceAtLeast(0) // alive, but no mod taken yet
+        val wanted = minOf(maxParallelMods - workerCount, queued - idle)
+        var started = 0
+        while (started < wanted) {
+            workerCount++
+            val id = nextWorkerId++
+            val delayMs = started * WORKER_STAGGER_MS
+            val t = Thread({ runWorker(delayMs) }, "download-worker-$id")
+            t.isDaemon = true
+            t.start()
+            started++
+        }
+    }
+
+    /**
+     * Takes the next waiting mod and marks it as running; null when there is none. A mod whose folder is being
+     * written by another worker right now is left for later. Call with [lock] held.
+     */
+    private fun claimNextLocked(): DownloadTask? {
+        val snapshot = _tasks.value
+        val busyDirs = HashSet<String>()
+        for (t in snapshot) {
+            if (t.status == TaskStatus.RUNNING) busyDirs.add(t.installDir)
+        }
+        val next = snapshot.firstOrNull { it.status == TaskStatus.QUEUED && it.installDir !in busyDirs } ?: return null
+        replace(next.workshopId) { it.copy(status = TaskStatus.RUNNING, percent = 0f, message = "Connecting…") }
+        return next
+    }
+
+    private fun runWorker(startDelayMs: Long) {
+        var downloader: SteamDownloader? = null
+        var connections = 0 // the number of connections the downloader above was made for
+        var current: DownloadTask? = null
         try {
+            if (startDelayMs > 0) {
+                try {
+                    Thread.sleep(startDelayMs)
+                } catch (e: InterruptedException) {
+                    // nobody interrupts a worker that has not started yet; just go on
+                }
+            }
             while (true) {
                 val task: DownloadTask
                 synchronized(lock) {
-                    val next = _tasks.value.firstOrNull { it.status == TaskStatus.QUEUED }
+                    // a worker that is too many for the current limit stops between two mods
+                    val next = if (workerCount > maxParallelMods) null else claimNextLocked()
                     if (next == null) {
-                        workerAlive = false
+                        workerCount--
                         return
                     }
                     task = next
-                    replace(task.workshopId) { it.copy(status = TaskStatus.RUNNING, percent = 0f, message = "Connecting…") }
                 }
-                val noConnection = runTask(downloader, task)
+                current = task
+                // a new downloader (a new login to Steam) only when the settings changed since the last mod
+                val want = connectionsPerMod()
+                val existing = downloader
+                val dl: SteamDownloader
+                if (existing != null && want == connections) {
+                    dl = existing
+                } else {
+                    downloader = null
+                    existing?.close()
+                    dl = downloaderFactory()
+                    downloader = dl
+                    connections = want
+                }
+                val noConnection = runTask(dl, task)
+                current = null
                 if (noConnection) {
                     // Every other item would wait through the same failed connection attempts; say so right away.
                     failQueued("Could not reach Steam. Check your internet connection, then tap Retry.")
@@ -227,19 +339,19 @@ object DownloadQueue {
         } catch (e: Throwable) {
             AppLog.e("Queue", "Worker crashed", e)
             synchronized(lock) {
-                workerAlive = false
-                _tasks.update { list ->
-                    list.map {
-                        if (it.status == TaskStatus.RUNNING || it.status == TaskStatus.QUEUED) {
-                            it.copy(status = TaskStatus.FAILED, message = "Internal error: ${e.message}")
-                        } else {
-                            it
-                        }
+                workerCount = (workerCount - 1).coerceAtLeast(0)
+                val id = current?.workshopId
+                if (id != null) {
+                    // only the mod of this worker fails; the other workers go on
+                    replace(id) {
+                        if (it.status == TaskStatus.RUNNING) it.copy(status = TaskStatus.FAILED, message = "Internal error: ${e.message}") else it
                     }
+                    cancelled.remove(id)
+                    startWorkersLocked()
                 }
             }
         } finally {
-            downloader.close()
+            downloader?.close()
         }
     }
 
@@ -276,11 +388,18 @@ object DownloadQueue {
         val request = DownloadRequest(task.workshopId, task.title, dir, task.expectedManifest, task.timeUpdated)
         var attempt = 1
         var outcome: DownloadOutcome
+        var lastPushMs = 0L
+        var lastStatus = ""
         while (true) {
             outcome = downloader.download(
                 request,
                 onProgress = { p ->
-                    replace(task.workshopId) { it.copy(percent = p.percent, bytes = p.bytes, message = p.status) }
+                    val now = System.nanoTime() / 1_000_000L
+                    if (p.status != lastStatus || now - lastPushMs >= PROGRESS_PUSH_MS || p.percent >= 1f) {
+                        lastStatus = p.status
+                        lastPushMs = now
+                        replace(task.workshopId) { it.copy(percent = p.percent, bytes = p.bytes, message = p.status) }
+                    }
                 },
                 isCancelled = { isCancelled(task.workshopId) },
             )

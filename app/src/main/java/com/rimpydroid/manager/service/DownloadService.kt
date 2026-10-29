@@ -129,12 +129,27 @@ class DownloadService : Service() {
     }
 
     private fun buildNotification(tasks: List<DownloadTask>): Notification {
-        val total = tasks.count { it.status != TaskStatus.CANCELLED }
-        val finished = tasks.count { it.status == TaskStatus.DONE || it.status == TaskStatus.FAILED }
-        val running = tasks.firstOrNull { it.status == TaskStatus.RUNNING }
-        val title = if (total <= 1) "Downloading mod" else "Downloading mods (${minOf(finished + 1, total)} of $total)"
-        val text = running?.title ?: "Waiting…"
-        val percent = ((running?.percent ?: 0f) * 100).toInt().coerceIn(0, 100)
+        val counted = tasks.filter { it.status != TaskStatus.CANCELLED }
+        val total = counted.size
+        val finished = counted.count { it.status == TaskStatus.DONE || it.status == TaskStatus.FAILED }
+        val running = tasks.filter { it.status == TaskStatus.RUNNING }
+        val title = if (total <= 1) "Downloading mod" else "Downloading mods ($finished of $total done)"
+        val text = when {
+            running.isEmpty() -> "Waiting…"
+            running.size == 1 -> running[0].title
+            else -> "${running.size} at a time: " + running.take(3).joinToString(", ") { it.title } + (if (running.size > 3) "…" else "")
+        }
+        // overall progress of everything that was not cancelled; finished mods count as complete
+        var sum = 0.0
+        for (t in counted) {
+            sum += when (t.status) {
+                TaskStatus.DONE, TaskStatus.FAILED -> 1.0
+                TaskStatus.RUNNING -> t.percent.toDouble()
+                else -> 0.0
+            }
+        }
+        val fraction = if (total > 0) sum / total else 0.0
+        val percent = (fraction * 100).toInt().coerceIn(0, 100)
 
         val cancel = PendingIntent.getService(
             this, 1,
@@ -147,7 +162,7 @@ class DownloadService : Service() {
             .setContentText(text)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .setProgress(100, percent, running == null || running.percent <= 0f)
+            .setProgress(100, percent, running.isEmpty() || percent == 0)
             .setContentIntent(openAppIntent())
             .addAction(0, "Cancel all", cancel)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)

@@ -49,6 +49,7 @@ import com.rimpydroid.manager.BuildConfig
 import com.rimpydroid.manager.core.AppConfig
 import com.rimpydroid.manager.core.GameLocator
 import com.rimpydroid.manager.core.ThemeColors
+import com.rimpydroid.manager.service.DownloadQueue
 import kotlin.math.roundToInt
 
 private val THEME_CHOICES = listOf(
@@ -163,13 +164,46 @@ fun SettingsScreen(vm: AppViewModel, padding: PaddingValues, onGrantStorage: () 
 
         // ---- downloads ----
         item(key = "downloads") {
+            var modsAtOnce by remember(cfg.parallelMods) { mutableStateOf(cfg.parallelMods.toFloat()) }
             Column {
                 SectionTitle("Downloads")
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "Mods downloaded at the same time",
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Text(modsAtOnce.roundToInt().toString(), style = MaterialTheme.typography.titleMedium)
+                }
+                Slider(
+                    value = modsAtOnce,
+                    onValueChange = { modsAtOnce = it },
+                    onValueChangeFinished = {
+                        val n = modsAtOnce.roundToInt().coerceIn(AppConfig.MIN_PARALLEL_MODS, AppConfig.MAX_PARALLEL_MODS)
+                        vm.updateConfig { it.copy(parallelMods = n) }
+                    },
+                    valueRange = AppConfig.MIN_PARALLEL_MODS.toFloat()..AppConfig.MAX_PARALLEL_MODS.toFloat(),
+                    steps = AppConfig.MAX_PARALLEL_MODS - AppConfig.MIN_PARALLEL_MODS - 1,
+                    modifier = Modifier.padding(horizontal = 16.dp),
+                )
                 Text(
-                    "Parallel connections per mod. More is faster on a good connection, fewer is gentler on weak Wi-Fi.",
+                    "1 means one mod after another. A higher number finishes a long list sooner, most of all a list of many " +
+                        "small mods. The connections to Steam are shared out between the mods, so a high number does not " +
+                        "overload the phone. Use a lower number on weak Wi-Fi.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 16.dp),
+                )
+                Text(
+                    "Download connections, shared by all mods that download at once. More is faster on a good connection, " +
+                        "fewer is gentler on weak Wi-Fi. The app also keeps it within your phone's memory: " +
+                        "at most ${DownloadQueue.memoryCap()} on this phone.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 12.dp),
                 )
                 Row(
                     Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
