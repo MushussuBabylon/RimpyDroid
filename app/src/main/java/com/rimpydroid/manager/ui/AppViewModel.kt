@@ -133,6 +133,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         DownloadQueue.maxDownloads = _config.value.maxDownloads
+        DownloadQueue.maxParallelMods = _config.value.parallelMods
         rules = rulesStore.cached() ?: CommunityRules.EMPTY
         publishRulesInfo()
         refreshLists()
@@ -208,6 +209,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _config.value = new
         settings.save(new)
         DownloadQueue.maxDownloads = new.maxDownloads
+        DownloadQueue.maxParallelMods = new.parallelMods
         val pathsChanged = new.gameDir != old.gameDir || new.modsDir != old.modsDir || new.configPath != old.configPath
         if (pathsChanged) {
             reload()
@@ -470,6 +472,71 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             scheduleSave()
             if (ok) say("Deleted ${mod.name}") else say("Could not delete everything in ${mod.dir.name}.")
         }
+    }
+
+    /**
+     * Deletes many mod folders at once (the Clean up tool). Core and the DLCs are never touched, and neither is a
+     * folder that is being downloaded into right now. Deleted mods also leave the load order.
+     */
+    fun deleteMods(targets: List<ModEntry>) {
+        val wanted = targets.filter { !it.isOfficial }.distinctBy { it.key }
+        if (wanted.isEmpty()) return
+        viewModelScope.launch {
+            val busy = HashSet<String>()
+            for (t in DownloadQueue.tasks.value) {
+                if (t.status == TaskStatus.QUEUED || t.status == TaskStatus.RUNNING) busy.add(t.installDir)
+            }
+            val gone = ArrayList<ModEntry>()
+            var failed = 0
+            var skipped = 0
+            withContext(Dispatchers.IO) {
+                for (m in wanted) {
+                    if (m.dir.absolutePath in busy) {
+                        skipped++
+                    } else if (FileUtil.deleteRecursive(m.dir)) {
+                        gone.add(m)
+                    } else {
+                        failed++
+                    }
+                }
+            }
+            if (gone.isNotEmpty()) {
+                val goneKeys = HashSet<String>()
+                for (m in gone) goneKeys.add(m.key)
+                undoList = null // an old "Undo" must not bring back mods that no longer exist
+                _library.update { s ->
+                    val mods = s.mods.filter { it.key !in goneKeys }
+                    var newActive = s.active
+                    for (m in gone) {
+                        // an id stays in the load order while another folder still provides it
+                        if (m.id.isNotEmpty() && mods.none { it.id == m.id }) newActive = ActiveListOps.deactivate(newActive, m.id)
+                    }
+                    val updates = s.updates.filterKeys { it !in goneKeys }
+                    withMods(s, mods).copy(active = newActive, updates = updates, updateSummary = ModelOps.summarize(updates))
+                }
+                val open = _page.value
+                if (open is Page.ModDetails && open.key in goneKeys) closePage()
+                scheduleRecompute()
+                scheduleSave()
+            }
+            val parts = ArrayList<String>()
+            parts.add(if (gone.size == 1) "Deleted 1 mod" else "Deleted ${gone.size} mods")
+            if (failed > 0) parts.add("$failed could not be deleted completely")
+            if (skipped > 0) parts.add("$skipped skipped (being downloaded)")
+            say(parts.joinToString(", "))
+        }
+    }
+
+    /** Takes every enabled mod that does not fit the game version out of the load order. The files stay; Undo is offered. */
+    fun disableIncompatible() {
+        val s = _library.value
+        val ids = com.rimpydroid.manager.core.Cleanup.incompatibleActiveIds(s.mods, s.active, s.game)
+        if (ids.isEmpty()) {
+            say("None of the enabled mods is incompatible with this game version.")
+            return
+        }
+        val note = if (ids.size == 1) "Disabled 1 incompatible mod" else "Disabled ${ids.size} incompatible mods"
+        setActive(ActiveListOps.deactivateAll(s.active, ids), note, undoable = true)
     }
 
     // ---- saving ---------------------------------------------------------------------------------

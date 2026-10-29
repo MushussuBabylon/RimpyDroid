@@ -15,6 +15,8 @@ data class AppConfig(
     val autoCheckUpdates: Boolean = true,
     val versionTag: String = "",
     val maxDownloads: Int = 8,
+    /** How many mods are downloaded at the same time, [MIN_PARALLEL_MODS] to [MAX_PARALLEL_MODS]. */
+    val parallelMods: Int = DEFAULT_PARALLEL_MODS,
     /** [THEME_LIGHT] (white), [THEME_DARK] (black) or [THEME_SYSTEM] (follows the phone's setting). */
     val themeMode: Int = THEME_LIGHT,
     /**
@@ -37,6 +39,10 @@ data class AppConfig(
         const val THEME_LIGHT = 0
         const val THEME_DARK = 1
         const val THEME_SYSTEM = 2
+
+        const val MIN_PARALLEL_MODS = 1
+        const val MAX_PARALLEL_MODS = 5
+        const val DEFAULT_PARALLEL_MODS = 3
     }
 }
 

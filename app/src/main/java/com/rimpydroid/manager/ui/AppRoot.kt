@@ -148,6 +148,8 @@ private fun MainTopBar(vm: AppViewModel, tab: Int) {
     val lib by vm.library.collectAsState()
     val cfg by vm.config.collectAsState()
     var menu by remember { mutableStateOf(false) }
+    var showCleanup by remember { mutableStateOf(false) }
+    if (showCleanup) CleanupDialog(vm = vm, onDismiss = { showCleanup = false })
     val title = when (tab) {
         0 -> "Mods"
         1 -> "Workshop"
@@ -196,6 +198,13 @@ private fun MainTopBar(vm: AppViewModel, tab: Int) {
                                 },
                             )
                             DropdownMenuItem(
+                                text = { Text("Clean up mods…") },
+                                onClick = {
+                                    menu = false
+                                    showCleanup = true
+                                },
+                            )
+                            DropdownMenuItem(
                                 text = { Text("Reload from disk") },
                                 onClick = {
                                     menu = false
@@ -233,7 +242,18 @@ private fun MainTopBar(vm: AppViewModel, tab: Int) {
 private fun DownloadMiniBar(tasks: List<DownloadTask>, onClick: () -> Unit) {
     val active = tasks.filter { it.status == TaskStatus.RUNNING || it.status == TaskStatus.QUEUED }
     if (active.isEmpty()) return
-    val running = active.firstOrNull { it.status == TaskStatus.RUNNING }
+    val running = active.filter { it.status == TaskStatus.RUNNING }
+    // overall progress of everything that was not cancelled; finished mods count as complete
+    val counted = tasks.filter { it.status != TaskStatus.CANCELLED }
+    var sum = 0f
+    for (t in counted) {
+        sum += when (t.status) {
+            TaskStatus.DONE, TaskStatus.FAILED -> 1f
+            TaskStatus.RUNNING -> t.percent
+            else -> 0f
+        }
+    }
+    val overall = if (counted.isNotEmpty()) (sum / counted.size).coerceIn(0f, 1f) else 0f
     Surface(
         modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
         tonalElevation = 3.dp,
@@ -241,7 +261,11 @@ private fun DownloadMiniBar(tasks: List<DownloadTask>, onClick: () -> Unit) {
         Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    if (running != null) "Downloading: ${running.title}" else "Downloads waiting",
+                    when {
+                        running.size > 1 -> "Downloading ${running.size} mods at once"
+                        running.size == 1 -> "Downloading: ${running[0].title}"
+                        else -> "Downloads waiting"
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -250,7 +274,7 @@ private fun DownloadMiniBar(tasks: List<DownloadTask>, onClick: () -> Unit) {
                 Text("${active.size} left", style = MaterialTheme.typography.labelMedium)
             }
             LinearProgressIndicator(
-                progress = { running?.percent ?: 0f },
+                progress = { overall },
                 modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
             )
         }

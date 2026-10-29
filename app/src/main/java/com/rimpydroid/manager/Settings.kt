@@ -20,6 +20,8 @@ class Settings(context: Context) {
             autoCheckUpdates = prefs.getBoolean(K_AUTO_UPDATES, d.autoCheckUpdates),
             versionTag = prefs.getString(K_VERSION_TAG, d.versionTag) ?: d.versionTag,
             maxDownloads = prefs.getInt(K_MAX_DOWNLOADS, d.maxDownloads).coerceIn(2, 25),
+            parallelMods = prefs.getInt(K_PARALLEL_MODS, d.parallelMods)
+                .coerceIn(AppConfig.MIN_PARALLEL_MODS, AppConfig.MAX_PARALLEL_MODS),
             themeMode = prefs.getInt(K_THEME, d.themeMode).coerceIn(AppConfig.THEME_LIGHT, AppConfig.THEME_SYSTEM),
             accentColor = prefs.getInt(K_ACCENT, d.accentColor).let { if (it == 0) 0 else ThemeColors.opaque(it) },
         )
@@ -35,6 +37,7 @@ class Settings(context: Context) {
             .putBoolean(K_AUTO_UPDATES, c.autoCheckUpdates)
             .putString(K_VERSION_TAG, c.versionTag)
             .putInt(K_MAX_DOWNLOADS, c.maxDownloads.coerceIn(2, 25))
+            .putInt(K_PARALLEL_MODS, c.parallelMods.coerceIn(AppConfig.MIN_PARALLEL_MODS, AppConfig.MAX_PARALLEL_MODS))
             .putInt(K_THEME, c.themeMode.coerceIn(AppConfig.THEME_LIGHT, AppConfig.THEME_SYSTEM))
             .putInt(K_ACCENT, if (c.accentColor == 0) 0 else ThemeColors.opaque(c.accentColor))
             .apply()
@@ -56,6 +59,7 @@ class Settings(context: Context) {
         const val K_AUTO_UPDATES = "auto_check_updates"
         const val K_VERSION_TAG = "version_tag"
         const val K_MAX_DOWNLOADS = "max_downloads"
+        const val K_PARALLEL_MODS = "parallel_mods"
         const val K_THEME = "theme_mode"
         const val K_ACCENT = "accent_color"
         const val K_ASKED_NOTIF = "asked_notifications"

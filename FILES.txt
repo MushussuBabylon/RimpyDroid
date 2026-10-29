@@ -15,6 +15,7 @@ app/src/main/java/com/rimpydroid/manager/Settings.kt
 app/src/main/java/com/rimpydroid/manager/core/AboutParser.kt
 app/src/main/java/com/rimpydroid/manager/core/ActiveListOps.kt
 app/src/main/java/com/rimpydroid/manager/core/Analyzer.kt
+app/src/main/java/com/rimpydroid/manager/core/Cleanup.kt
 app/src/main/java/com/rimpydroid/manager/core/CommunityRules.kt
 app/src/main/java/com/rimpydroid/manager/core/FileUtil.kt
 app/src/main/java/com/rimpydroid/manager/core/GameLocator.kt
@@ -40,6 +41,8 @@ app/src/main/java/com/rimpydroid/manager/steam/SteamDownloader.kt
 app/src/main/java/com/rimpydroid/manager/steam/SteamSession.kt
 app/src/main/java/com/rimpydroid/manager/ui/AppRoot.kt
 app/src/main/java/com/rimpydroid/manager/ui/AppViewModel.kt
+app/src/main/java/com/rimpydroid/manager/ui/CleanupDialog.kt
+app/src/main/java/com/rimpydroid/manager/steam/ChunkGate.kt
 app/src/main/java/com/rimpydroid/manager/ui/Components.kt
 app/src/main/java/com/rimpydroid/manager/ui/Details.kt
 app/src/main/java/com/rimpydroid/manager/ui/FolderPicker.kt
