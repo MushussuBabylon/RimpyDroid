@@ -1,0 +1,311 @@
+name: Build APK
+
+# Builds an installable RimpyDroid APK on GitHub's servers, so nothing has to be set up on your own computer.
+#
+#   * It runs ONLY when you start it yourself: Actions tab -> "Build APK" -> "Run workflow".
+#   * Each run produces an APK you can download from the run page under Artifacts.
+#   * Starting it from a tag that begins with "v" also publishes the APK as a GitHub release.
+#   * If the build fails, the run page lists the compile errors in the Summary.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build release APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v5
+
+      - name: Check that the upload is complete
+        run: |
+          if ! grep -q "pluginManagement" settings.gradle.kts 2>/dev/null; then
+            echo "::warning title=settings.gradle.kts is missing::It is not in the repository (or is incomplete), so a built-in copy is used for this build. Please upload the file settings.gradle.kts to the top folder of the repository."
+            cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "RimpyDroid"
+          include(":app")
+          EOF
+          fi
+
+          if [ ! -f FILES.txt ]; then
+            echo "::warning title=FILES.txt is missing::The upload cannot be checked without it."
+            exit 0
+          fi
+
+          missing=0
+          : > missing.txt
+
+          while IFS= read -r f; do
+            case "$f" in ""|"#"*) continue ;; esac
+            if [ ! -e "$f" ]; then
+              echo "MISSING: $f"
+              echo "$f" >> missing.txt
+              missing=$((missing + 1))
+            fi
+          done < FILES.txt
+
+          if [ "$missing" -gt 0 ]; then
+            {
+              echo "### $missing file(s) did not arrive in the repository"
+              echo ""
+              echo "Upload them again (Add file > Upload files, keeping their folders), then re-run the build:"
+              echo ""
+              echo '```'
+              cat missing.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Prepare the signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          KEY_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          ks="$RUNNER_TEMP/rimpydroid-signing.p12"
+
+          if [ -n "${KEYSTORE_BASE64:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | tr -d ' \r\n\t' | base64 -d > "$ks" || true
+
+            if ! keytool -list -keystore "$ks" -storetype PKCS12 -storepass "$KEY_PASSWORD" -alias rimpydroid > /dev/null 2>&1; then
+              echo "::error title=The signing key does not open::SIGNING_KEYSTORE_BASE64 and SIGNING_PASSWORD are set but do not fit together. Create both again (README, Signing key)."
+              exit 1
+            fi
+
+            echo "Signing with the key from the repository secrets."
+          else
+            KEY_PASSWORD="$(openssl rand -hex 16)"
+            echo "::add-mask::$KEY_PASSWORD"
+
+            keytool -genkeypair \
+              -keystore "$ks" \
+              -storetype PKCS12 \
+              -alias rimpydroid \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=RimpyDroid one-off key" \
+              -storepass "$KEY_PASSWORD" \
+              -keypass "$KEY_PASSWORD" > /dev/null 2>&1
+
+            echo "::warning title=No signing key is set::This APK is signed with a one-off key. It cannot be installed over an earlier version (uninstall that one first), and the next build gets another key. Add the two repository secrets from the README to fix this."
+
+            {
+              echo "### This APK is signed with a one-off key"
+              echo ""
+              echo "No signing key is set for the repository, so this build made its own. Such an APK cannot be installed over an"
+              echo "earlier version (uninstall that one first), and the next build is signed with a different key."
+              echo "To keep updating the same install, add the secrets \`SIGNING_KEYSTORE_BASE64\` and \`SIGNING_PASSWORD\`"
+              echo "(Settings > Secrets and variables > Actions); the README, section \"Signing key\", explains how."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "RIMPYDROID_KEYSTORE=$ks" >> "$GITHUB_ENV"
+          echo "RIMPYDROID_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+
+      - name: Accept the Android SDK licences
+        run: |
+          yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Set up Gradle (with caching)
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Make the Gradle wrapper executable
+        run: chmod +x gradlew
+
+      - name: Build
+        run: |
+          set -o pipefail
+          ./gradlew assembleRelease --no-daemon --stacktrace --console=plain 2>&1 | tee build.log
+
+      - name: List the build errors in the run summary
+        if: failure()
+        run: bash .github/scripts/summarize-failure.sh build.log "The build failed" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect the APK
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          apk="$(find app/build/outputs/apk/release -name '*.apk' | head -n 1)"
+
+          if [ -z "$apk" ]; then
+            echo "No APK was produced" >&2
+            exit 1
+          fi
+
+          cp "$apk" dist/RimpyDroid.apk
+
+          {
+            echo "### RimpyDroid APK"
+            echo ""
+            echo "Size: $(du -h dist/RimpyDroid.apk | cut -f1)"
+            echo ""
+            echo "SHA-256: \`$(sha256sum dist/RimpyDroid.apk | cut -d' ' -f1)\`"
+            echo ""
+            echo "Download it from the **Artifacts** section at the bottom of this page, unzip it and install RimpyDroid.apk on your phone."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: RimpyDroid-apk-${{ github.run_number }}
+          path: dist/RimpyDroid.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  unit-tests:
+    name: Unit tests
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: true
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v5
+
+      - name: Check that the upload is complete
+        run: |
+          if ! grep -q "pluginManagement" settings.gradle.kts 2>/dev/null; then
+            echo "::warning title=settings.gradle.kts is missing::It is not in the repository (or is incomplete), so a built-in copy is used for this build. Please upload the file settings.gradle.kts to the top folder of the repository."
+            cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "RimpyDroid"
+          include(":app")
+          EOF
+          fi
+
+          if [ ! -f FILES.txt ]; then
+            echo "::warning title=FILES.txt is missing::The upload cannot be checked without it."
+            exit 0
+          fi
+
+          missing=0
+          : > missing.txt
+
+          while IFS= read -r f; do
+            case "$f" in ""|"#"*) continue ;; esac
+            if [ ! -e "$f" ]; then
+              echo "MISSING: $f"
+              echo "$f" >> missing.txt
+              missing=$((missing + 1))
+            fi
+          done < FILES.txt
+
+          if [ "$missing" -gt 0 ]; then
+            {
+              echo "### $missing file(s) did not arrive in the repository"
+              echo ""
+              echo "Upload them again (Add file > Upload files, keeping their folders), then re-run the build:"
+              echo ""
+              echo '```'
+              cat missing.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Accept the Android SDK licences
+        run: |
+          yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Set up Gradle (with caching)
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Make the Gradle wrapper executable
+        run: chmod +x gradlew
+
+      - name: Run the tests
+        run: |
+          set -o pipefail
+          ./gradlew testDebugUnitTest --no-daemon --stacktrace --console=plain 2>&1 | tee test.log
+
+      - name: List the failures in the run summary
+        if: failure()
+        run: bash .github/scripts/summarize-failure.sh test.log "The unit tests failed (the APK is built anyway)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the test report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: unit-test-report
+          path: app/build/reports/tests/testDebugUnitTest
+          if-no-files-found: ignore
+          retention-days: 14
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download the APK built above
+        uses: actions/download-artifact@v6
+        with:
+          name: RimpyDroid-apk-${{ github.run_number }}
+          path: dist
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/RimpyDroid.apk
+          generate_release_notes: true

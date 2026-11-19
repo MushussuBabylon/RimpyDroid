@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The app draws its own dark scheme (Settings > Appearance), so the system must not darken it a second time
+         (some phones, Xiaomi included, offer to force dark mode on every app). -->
+    <style name="Theme.RimpyDroid" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/window_bg</item>
+        <item name="android:forceDarkAllowed">false</item>
+    </style>
+</resources>
